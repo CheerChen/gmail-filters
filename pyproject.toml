@@ -1,0 +1,24 @@
+[project]
+name = "gmail-filters-audit"
+version = "0.1.0"
+description = "Audit Gmail filters by checking the last matching message."
+readme = "prompt.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-api-python-client",
+    "google-auth-oauthlib",
+    "rich",
+    "tabulate",
+    "tldextract",
+]
+
+[project.scripts]
+audit-filters = "audit_filters:main"
+discover-domains = "discover_domains:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
