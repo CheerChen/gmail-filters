@@ -528,15 +528,22 @@ def run_apply(
     archive: bool = True,
     sleep_seconds: float = 0.1,
     sleep_fn: Callable[[float], None] = time.sleep,
+    prefetched_labels: list[dict[str, Any]] | None = None,
+    prefetched_filters: list[dict[str, Any]] | None = None,
 ) -> ApplySummary:
-    label_list_resp = execute_request(
-        service.users().labels().list(userId="me"),
-        sleep_seconds=sleep_seconds,
-        sleep_fn=sleep_fn,
-    )
+    if prefetched_labels is not None:
+        raw_labels = prefetched_labels
+    else:
+        label_list_resp = execute_request(
+            service.users().labels().list(userId="me"),
+            sleep_seconds=sleep_seconds,
+            sleep_fn=sleep_fn,
+        )
+        raw_labels = label_list_resp.get("labels", [])
+
     existing_labels: dict[str, str] = {
         lbl["name"]: lbl["id"]
-        for lbl in label_list_resp.get("labels", [])
+        for lbl in raw_labels
         if lbl.get("name") and lbl.get("id")
     }
 
@@ -551,45 +558,62 @@ def run_apply(
         existing_labels[label_prefix] = parent_label["id"]
         print(f"  Parent label created: {label_prefix}")
 
-    existing_filter_map: dict[str, str] = {}
-    for f in fetch_filters(service, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn):
+    # Map from criteria.from -> (filter_id, label_id) for existing filters
+    raw_filters = (
+        prefetched_filters
+        if prefetched_filters is not None
+        else fetch_filters(service, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn)
+    )
+    existing_filter_map: dict[str, tuple[str, str]] = {}
+    for f in raw_filters:
         criteria = f.get("criteria") or {}
         from_val = criteria.get("from", "").strip().lower()
-        if from_val.startswith("@") and f.get("id"):
-            existing_filter_map[from_val] = f["id"]
+        add_labels = (f.get("action") or {}).get("addLabelIds", [])
+        if from_val.startswith("@") and f.get("id") and add_labels:
+            existing_filter_map[from_val] = (f["id"], add_labels[0])
+
+    # Reverse map: label_id -> label_name
+    label_id_to_name: dict[str, str] = {v: k for k, v in existing_labels.items()}
 
     labels_created = labels_reused = filters_created = filters_skipped = 0
     domains_applied = domains_failed = 0
 
     for candidate in candidates:
         domain = candidate.domain
-        label_name = f"{label_prefix}/{candidate.display_name}"
         msg_ids = message_ids_by_domain.get(domain, ())
         try:
-            if label_name in existing_labels:
-                label_id = existing_labels[label_name]
-                labels_reused += 1
-                print(f"  [{domain}] Label reused: {label_name}")
-            else:
-                req = service.users().labels().create(
-                    userId="me", body={"name": label_name}
-                )
-                new_label = execute_request(
-                    req, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn
-                )
-                label_id = new_label["id"]
-                existing_labels[label_name] = label_id
-                labels_created += 1
-                print(f"  [{domain}] Label created: {label_name}")
-
             target_from = f"@{domain}".lower()
             if target_from in existing_filter_map:
+                # Filter already exists — reuse its label regardless of display_name
+                existing_fid, existing_lid = existing_filter_map[target_from]
+                label_id = existing_lid
+                label_name = label_id_to_name.get(existing_lid, f"<id:{existing_lid}>")
+                labels_reused += 1
                 filters_skipped += 1
+                print(f"  [{domain}] Label reused: {label_name}")
                 print(
                     f"  [{domain}] Filter skipped "
-                    f"(already exists: {existing_filter_map[target_from]})"
+                    f"(already exists: {existing_fid})"
                 )
             else:
+                # New domain — create label and filter
+                label_name = f"{label_prefix}/{candidate.display_name}"
+                if label_name in existing_labels:
+                    label_id = existing_labels[label_name]
+                    labels_reused += 1
+                    print(f"  [{domain}] Label reused: {label_name}")
+                else:
+                    req = service.users().labels().create(
+                        userId="me", body={"name": label_name}
+                    )
+                    new_label = execute_request(
+                        req, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn
+                    )
+                    label_id = new_label["id"]
+                    existing_labels[label_name] = label_id
+                    labels_created += 1
+                    print(f"  [{domain}] Label created: {label_name}")
+
                 filter_action: dict[str, Any] = {"addLabelIds": [label_id]}
                 if archive:
                     filter_action["removeLabelIds"] = ["INBOX"]
@@ -842,12 +866,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             print()
             archive_mode = "archive" if not args.no_archive else "label only"
+
+            # Fetch filters and labels once, reuse for display and apply
+            all_filters = fetch_filters(service, sleep_seconds=0.1)
+            label_list_resp = execute_request(
+                service.users().labels().list(userId="me"), sleep_seconds=0.1
+            )
+            raw_labels = label_list_resp.get("labels", [])
+            lid_to_name: dict[str, str] = {
+                lbl["id"]: lbl["name"]
+                for lbl in raw_labels
+                if lbl.get("id") and lbl.get("name")
+            }
+            existing_label_for_domain: dict[str, str] = {}
+            for f in all_filters:
+                from_val = (f.get("criteria") or {}).get("from", "").strip().lower()
+                add_labels = (f.get("action") or {}).get("addLabelIds", [])
+                if from_val.startswith("@") and add_labels:
+                    domain_key = from_val[1:]  # strip leading @
+                    lname = lid_to_name.get(add_labels[0])
+                    if lname:
+                        existing_label_for_domain[domain_key] = lname
+
             print(f"Planned actions (mode: {archive_mode}):")
             for candidate in candidates:
-                label_name = f"{args.label_prefix}/{candidate.display_name}"
+                existing_name = existing_label_for_domain.get(candidate.domain)
+                if existing_name:
+                    label_name = existing_name
+                    status = "existing"
+                else:
+                    label_name = f"{args.label_prefix}/{candidate.display_name}"
+                    status = "new"
                 msg_count = len(summary.message_ids_by_domain.get(candidate.domain, ()))
                 print(
-                    f"  {candidate.domain:<30}  label={label_name!r}  "
+                    f"  {candidate.domain:<30}  label={label_name!r} ({status})  "
                     f"filter=from:@{candidate.domain}  existing_msgs={msg_count}"
                 )
             print()
@@ -863,6 +915,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 summary.message_ids_by_domain,
                 args.label_prefix,
                 archive=not args.no_archive,
+                prefetched_labels=raw_labels,
+                prefetched_filters=all_filters,
             )
             print_apply_summary(apply_summary)
         return 0
